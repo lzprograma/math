@@ -1,0 +1,967 @@
+
+"""
+LRG–NS SIMULATOR
+LUNZ RESEARCH GROUP
+Versão monolítica — arquivo único
+
+Instalação:
+    pip install numpy scipy streamlit plotly
+
+Execução:
+    streamlit run lrg_ns_simulator.py
+
+AVISO CIENTÍFICO:
+Este programa é um simulador numérico exploratório.
+Uma simulação em grade finita não prova existência global
+nem demonstra blow-up em tempo finito.
+"""
+
+import math
+import re
+from dataclasses import dataclass
+
+import numpy as np
+import streamlit as st
+import plotly.graph_objects as go
+
+
+# ============================================================
+# 1. STOKESENG — LINGUAGEM MATEMÁTICA DECLARATIVA
+# ============================================================
+
+class StokesEngError(Exception):
+    pass
+
+
+class StokesEng:
+
+    OPERATORS = {
+        "GRAD",
+        "DIV",
+        "CURL",
+        "LAPLACIAN",
+        "ADVECT",
+        "D",
+        "INTEGRAL",
+        "VECTOR",
+        "SCALAR"
+    }
+
+    @classmethod
+    def compile(cls, source):
+
+        instructions = []
+
+        for line_number, raw_line in enumerate(
+            source.splitlines(), start=1
+        ):
+
+            line = raw_line.split("#", 1)[0].strip()
+
+            if not line:
+                continue
+
+            if "=" not in line:
+                raise StokesEngError(
+                    f"Linha {line_number}: esperado '='."
+                )
+
+            target, expression = map(
+                str.strip, line.split("=", 1)
+            )
+
+            if not re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*", target
+            ):
+                raise StokesEngError(
+                    f"Linha {line_number}: identificador inválido."
+                )
+
+            match = re.fullmatch(
+                r"([A-Z]+)\((.*)\)", expression
+            )
+
+            if not match:
+                raise StokesEngError(
+                    f"Linha {line_number}: expressão inválida."
+                )
+
+            operator, arguments = match.groups()
+
+            if operator not in cls.OPERATORS:
+                raise StokesEngError(
+                    f"Linha {line_number}: operador desconhecido."
+                )
+
+            if not arguments.strip():
+                raise StokesEngError(
+                    f"Linha {line_number}: argumentos ausentes."
+                )
+
+            if not re.fullmatch(
+                r"[A-Za-z0-9_.,+\-*/ ()]+",
+                arguments
+            ):
+                raise StokesEngError(
+                    f"Linha {line_number}: caracteres proibidos."
+                )
+
+            instructions.append(
+                (target, operator, arguments)
+            )
+
+        return instructions
+
+
+# ============================================================
+# 2. CONFIGURAÇÃO DA SIMULAÇÃO
+# ============================================================
+
+@dataclass
+class SimulationConfig:
+
+    n: int = 16
+
+    length: float = 2 * math.pi
+
+    viscosity: float = 0.01
+
+    dt: float = 0.002
+
+    steps: int = 50
+
+    cfl: float = 0.35
+
+    amplitude: float = 1.0
+
+    initial_field: str = "Taylor-Green"
+
+    forcing: float = 0.0
+
+
+# ============================================================
+# 3. NÚCLEO NAVIER-STOKES 3D
+# ============================================================
+
+class NavierStokes3D:
+
+    def __init__(self, config):
+
+        self.cfg = config
+
+        self.n = config.n
+
+        self.L = config.length
+
+        if self.n < 8:
+            raise ValueError("Resolução mínima: N=8.")
+
+        if self.cfg.viscosity < 0:
+            raise ValueError("Viscosidade não pode ser negativa.")
+
+        if self.cfg.dt <= 0 or self.L <= 0:
+            raise ValueError("Parâmetros inválidos.")
+
+        self.dx = self.L / self.n
+
+        self.x = np.arange(self.n) * self.dx
+
+        self.X, self.Y, self.Z = np.meshgrid(
+            self.x,
+            self.x,
+            self.x,
+            indexing="ij"
+        )
+
+        k = 2 * np.pi * np.fft.fftfreq(
+            self.n,
+            d=self.dx
+        )
+
+        self.KX, self.KY, self.KZ = np.meshgrid(
+            k, k, k,
+            indexing="ij"
+        )
+
+        self.K2 = (
+            self.KX**2 +
+            self.KY**2 +
+            self.KZ**2
+        )
+
+        # Evita divisão por zero no modo médio.
+        self.K2[0, 0, 0] = 1.0
+
+        self.u = self.initial_velocity()
+
+        self.time = 0.0
+
+        self.history = []
+
+        self.u = self.project(self.u)
+
+    # --------------------------------------------------------
+    # Campos iniciais
+    # --------------------------------------------------------
+
+    def initial_velocity(self):
+
+        A = self.cfg.amplitude
+
+        if self.cfg.initial_field == "Taylor-Green":
+
+            u = (
+                A *
+                np.sin(self.X) *
+                np.cos(self.Y) *
+                np.cos(self.Z)
+            )
+
+            v = (
+                -A *
+                np.cos(self.X) *
+                np.sin(self.Y) *
+                np.cos(self.Z)
+            )
+
+            w = np.zeros_like(u)
+
+        elif self.cfg.initial_field == "ABC":
+
+            u = (
+                A * np.sin(self.Z) +
+                A * np.cos(self.Y)
+            )
+
+            v = (
+                A * np.sin(self.X) +
+                A * np.cos(self.Z)
+            )
+
+            w = (
+                A * np.sin(self.Y) +
+                A * np.cos(self.X)
+            )
+
+        else:
+
+            ax = A * np.sin(self.Y) * np.sin(self.Z)
+
+            ay = A * np.sin(self.Z) * np.sin(self.X)
+
+            az = A * np.sin(self.X) * np.sin(self.Y)
+
+            u = self.derivative(az, 1) - self.derivative(ay, 2)
+
+            v = self.derivative(ax, 2) - self.derivative(az, 0)
+
+            w = self.derivative(ay, 0) - self.derivative(ax, 1)
+
+        return np.array([u, v, w])
+
+    # --------------------------------------------------------
+    # Operadores espectrais
+    # --------------------------------------------------------
+
+    def derivative(self, field, axis):
+
+        wave_numbers = [
+            self.KX,
+            self.KY,
+            self.KZ
+        ]
+
+        transformed = np.fft.fftn(field)
+
+        derivative_hat = (
+            1j *
+            wave_numbers[axis] *
+            transformed
+        )
+
+        return np.fft.ifftn(
+            derivative_hat
+        ).real
+
+    def gradient(self, field):
+
+        return np.array([
+            self.derivative(field, 0),
+            self.derivative(field, 1),
+            self.derivative(field, 2)
+        ])
+
+    def divergence(self, velocity=None):
+
+        if velocity is None:
+            velocity = self.u
+
+        return (
+            self.derivative(velocity[0], 0) +
+            self.derivative(velocity[1], 1) +
+            self.derivative(velocity[2], 2)
+        )
+
+    def curl(self, velocity=None):
+
+        if velocity is None:
+            velocity = self.u
+
+        return np.array([
+
+            self.derivative(velocity[2], 1) -
+            self.derivative(velocity[1], 2),
+
+            self.derivative(velocity[0], 2) -
+            self.derivative(velocity[2], 0),
+
+            self.derivative(velocity[1], 0) -
+            self.derivative(velocity[0], 1)
+
+        ])
+
+    def laplacian(self, field):
+
+        transformed = np.fft.fftn(field)
+
+        return np.fft.ifftn(
+            -self.K2 * transformed
+        ).real
+
+    # --------------------------------------------------------
+    # Projeção incompressível
+    # --------------------------------------------------------
+
+    def project(self, velocity):
+
+        velocity_hat = np.array([
+            np.fft.fftn(velocity[i])
+            for i in range(3)
+        ])
+
+        dot = (
+            self.KX * velocity_hat[0] +
+            self.KY * velocity_hat[1] +
+            self.KZ * velocity_hat[2]
+        )
+
+        pressure_hat = -dot / self.K2
+
+        velocity_hat[0] += 1j * self.KX * pressure_hat
+
+        velocity_hat[1] += 1j * self.KY * pressure_hat
+
+        velocity_hat[2] += 1j * self.KZ * pressure_hat
+
+        # Preserva o modo médio.
+        for i in range(3):
+            velocity_hat[i, 0, 0, 0] = (
+                np.fft.fftn(velocity[i])[0, 0, 0]
+            )
+
+        return np.array([
+            np.fft.ifftn(velocity_hat[i]).real
+            for i in range(3)
+        ])
+
+    # --------------------------------------------------------
+    # Termos da equação
+    # --------------------------------------------------------
+
+    def rhs(self, velocity):
+
+        advection = np.zeros_like(velocity)
+
+        for i in range(3):
+
+            for j in range(3):
+
+                advection[i] += (
+                    velocity[j] *
+                    self.derivative(velocity[i], j)
+                )
+
+        diffusion = np.array([
+
+            self.cfg.viscosity *
+            self.laplacian(velocity[i])
+
+            for i in range(3)
+
+        ])
+
+        force = np.zeros_like(velocity)
+
+        if self.cfg.forcing != 0:
+
+            force[0] = (
+                self.cfg.forcing *
+                np.sin(self.Z)
+            )
+
+        result = (
+            -advection +
+            diffusion +
+            force
+        )
+
+        return self.project(result)
+
+    # --------------------------------------------------------
+    # Controle temporal CFL
+    # --------------------------------------------------------
+
+    def stable_dt(self):
+
+        speed = np.sqrt(
+            np.sum(self.u**2, axis=0)
+        )
+
+        max_speed = max(
+            float(np.max(speed)),
+            1e-12
+        )
+
+        dt_advection = (
+            self.cfg.cfl *
+            self.dx /
+            max_speed
+        )
+
+        dt_diffusion = (
+            self.cfg.cfl *
+            self.dx**2 /
+            max(
+                6 * self.cfg.viscosity,
+                1e-12
+            )
+        )
+
+        return min(
+            self.cfg.dt,
+            dt_advection,
+            dt_diffusion
+        )
+
+    # --------------------------------------------------------
+    # Métricas físicas
+    # --------------------------------------------------------
+
+    def metrics(self):
+
+        speed = np.sqrt(
+            np.sum(self.u**2, axis=0)
+        )
+
+        vorticity = self.curl()
+
+        vorticity_norm = np.sqrt(
+            np.sum(vorticity**2, axis=0)
+        )
+
+        divergence = self.divergence()
+
+        energy = (
+            0.5 *
+            np.sum(self.u**2) *
+            self.dx**3
+        )
+
+        return {
+
+            "time": self.time,
+
+            "energy": float(energy),
+
+            "max_speed": float(np.max(speed)),
+
+            "max_vorticity": float(
+                np.max(vorticity_norm)
+            ),
+
+            "divergence_linf": float(
+                np.max(np.abs(divergence))
+            ),
+
+            "dt": self.stable_dt()
+
+        }
+
+    # --------------------------------------------------------
+    # Integração temporal RK2
+    # --------------------------------------------------------
+
+    def step(self):
+
+        dt = self.stable_dt()
+
+        k1 = self.rhs(self.u)
+
+        midpoint = self.project(
+            self.u + 0.5 * dt * k1
+        )
+
+        k2 = self.rhs(midpoint)
+
+        self.u = self.project(
+            self.u + dt * k2
+        )
+
+        self.time += dt
+
+        result = self.metrics()
+
+        self.history.append(result)
+
+        return result
+
+    def run(self, steps=None):
+
+        if steps is None:
+            steps = self.cfg.steps
+
+        for _ in range(int(steps)):
+            self.step()
+
+        return self.history
+
+
+# ============================================================
+# 4. ESCALAS ASSINTÓTICAS PARAMETRIZADAS
+# ============================================================
+
+def asymptotic_scales(t, h=0.005, amplitude=1.0):
+
+    if not 0 < h < 0.01:
+
+        raise ValueError(
+            "h deve satisfazer 0 < h < 0.01."
+        )
+
+    tau = max(1.0 - t, 1e-12)
+
+    ell_r = tau**0.5
+
+    ell_z = tau**(0.5 - h)
+
+    velocity = amplitude * tau**(-0.5 - h)
+
+    return {
+
+        "tau": tau,
+
+        "ell_r": ell_r,
+
+        "ell_z": ell_z,
+
+        "velocity": velocity
+
+    }
+
+
+# ============================================================
+# 5. INTERFACE PRINCIPAL
+# ============================================================
+
+def main():
+
+    st.set_page_config(
+        page_title="LRG NS Simulator",
+        layout="wide"
+    )
+
+    st.title("LRG–NS Simulator")
+
+    st.caption(
+        "Lunz Research Group | Laboratório numérico 3D"
+    )
+
+    st.sidebar.header("Configuração")
+
+    n = st.sidebar.select_slider(
+        "Resolução espacial N³",
+        options=[8, 12, 16, 20, 24, 32],
+        value=16
+    )
+
+    viscosity = st.sidebar.number_input(
+        "Viscosidade",
+        min_value=0.0,
+        value=0.01,
+        step=0.001
+    )
+
+    dt = st.sidebar.number_input(
+        "Passo temporal nominal",
+        min_value=0.00001,
+        value=0.002,
+        step=0.0005
+    )
+
+    steps = st.sidebar.slider(
+        "Número de passos",
+        min_value=1,
+        max_value=500,
+        value=50
+    )
+
+    amplitude = st.sidebar.slider(
+        "Amplitude inicial",
+        0.1,
+        3.0,
+        1.0
+    )
+
+    field = st.sidebar.selectbox(
+        "Campo inicial",
+        [
+            "Taylor-Green",
+            "ABC",
+            "Rotacional"
+        ]
+    )
+
+    forcing = st.sidebar.number_input(
+        "Força externa",
+        min_value=0.0,
+        value=0.0
+    )
+
+    execute = st.sidebar.button(
+        "EXECUTAR SIMULAÇÃO",
+        type="primary"
+    )
+
+    if "simulation" not in st.session_state:
+
+        st.session_state.simulation = None
+
+    if execute:
+
+        config = SimulationConfig(
+
+            n=n,
+
+            viscosity=viscosity,
+
+            dt=dt,
+
+            steps=steps,
+
+            amplitude=amplitude,
+
+            initial_field=field,
+
+            forcing=forcing
+
+        )
+
+        with st.spinner("Executando núcleo numérico..."):
+
+            simulation = NavierStokes3D(config)
+
+            simulation.run()
+
+            st.session_state.simulation = simulation
+
+    sim = st.session_state.simulation
+
+    st.markdown(
+        r"""
+        Equação governante:
+
+        \[
+        \partial_t u+(u\cdot\nabla)u
+        =-\nabla p+\nu\Delta u+f
+        \]
+
+        Restrição incompressível:
+
+        \[
+        \nabla\cdot u=0
+        \]
+        """
+    )
+
+    if sim is None:
+
+        st.info(
+            "Configure os parâmetros e execute a simulação."
+        )
+
+    else:
+
+        metrics = sim.metrics()
+
+        col1, col2, col3, col4 = st.columns(4)
+
+        col1.metric(
+            "Tempo",
+            f"{metrics['time']:.5f}"
+        )
+
+        col2.metric(
+            "Energia",
+            f"{metrics['energy']:.6g}"
+        )
+
+        col3.metric(
+            "Velocidade máxima",
+            f"{metrics['max_speed']:.6g}"
+        )
+
+        col4.metric(
+            "Divergência",
+            f"{metrics['divergence_linf']:.3e}"
+        )
+
+        st.subheader("Visualização do campo")
+
+        mid = sim.n // 2
+
+        stride = max(1, sim.n // 12)
+
+        xx, yy = np.meshgrid(
+            sim.x[::stride],
+            sim.x[::stride],
+            indexing="ij"
+        )
+
+        uu = sim.u[0, :, :, mid][::stride, ::stride]
+
+        vv = sim.u[1, :, :, mid][::stride, ::stride]
+
+        fig = go.Figure(
+
+            data=go.Cone(
+
+                x=xx.flatten(),
+
+                y=yy.flatten(),
+
+                z=np.zeros(xx.size),
+
+                u=uu.flatten(),
+
+                v=vv.flatten(),
+
+                w=np.zeros(xx.size),
+
+                sizemode="absolute",
+
+                sizeref=0.35,
+
+                anchor="tail"
+
+            )
+
+        )
+
+        fig.update_layout(
+
+            height=500,
+
+            scene=dict(
+
+                xaxis_title="X",
+
+                yaxis_title="Y",
+
+                zaxis_title="Plano central"
+
+            )
+
+        )
+
+        st.plotly_chart(
+            fig,
+            use_container_width=True
+        )
+
+        st.subheader("Evolução temporal")
+
+        if sim.history:
+
+            history = sim.history
+
+            chart = go.Figure()
+
+            chart.add_trace(
+
+                go.Scatter(
+
+                    y=[
+                        item["energy"]
+                        for item in history
+                    ],
+
+                    name="Energia cinética"
+
+                )
+
+            )
+
+            chart.add_trace(
+
+                go.Scatter(
+
+                    y=[
+                        item["max_vorticity"]
+                        for item in history
+                    ],
+
+                    name="Vorticidade máxima"
+
+                )
+
+            )
+
+            chart.update_layout(
+
+                xaxis_title="Passo",
+
+                yaxis_title="Valor",
+
+                height=350
+
+            )
+
+            st.plotly_chart(
+                chart,
+                use_container_width=True
+            )
+
+        st.subheader("Diagnóstico numérico")
+
+        st.write(
+            "Vorticidade máxima:",
+            metrics["max_vorticity"]
+        )
+
+        st.write(
+            "Passo adaptativo:",
+            metrics["dt"]
+        )
+
+        st.write(
+            "Resolução:",
+            f"{sim.n}³"
+        )
+
+    # ========================================================
+    # STOKESENG
+    # ========================================================
+
+    st.divider()
+
+    st.subheader("StokesEng — Editor matemático")
+
+    default_program = """
+# Programa StokesEng
+
+gradiente = GRAD(p)
+
+vorticidade = CURL(u)
+
+incompressibilidade = DIV(u)
+
+difusao = LAPLACIAN(u)
+"""
+
+    source = st.text_area(
+        "Código StokesEng",
+        value=default_program,
+        height=180
+    )
+
+    if st.button("COMPILAR STOKESENG"):
+
+        try:
+
+            instructions = StokesEng.compile(source)
+
+            st.success(
+                f"{len(instructions)} instruções válidas."
+            )
+
+            for target, operator, args in instructions:
+
+                st.code(
+                    f"{target} := {operator}({args})"
+                )
+
+        except StokesEngError as error:
+
+            st.error(str(error))
+
+    # ========================================================
+    # ESCALAS ASSINTÓTICAS
+    # ========================================================
+
+    st.divider()
+
+    st.subheader(
+        "Modelo de escalas assintóticas"
+    )
+
+    h = st.slider(
+        "Parâmetro h",
+        0.0001,
+        0.0099,
+        0.005,
+        0.0001
+    )
+
+    t = st.slider(
+        "Tempo normalizado",
+        0.0,
+        0.99,
+        0.9,
+        0.01
+    )
+
+    scales = asymptotic_scales(
+        t,
+        h,
+        amplitude
+    )
+
+    a, b, c = st.columns(3)
+
+    a.metric(
+        "Escala radial",
+        f"{scales['ell_r']:.5e}"
+    )
+
+    b.metric(
+        "Escala axial",
+        f"{scales['ell_z']:.5e}"
+    )
+
+    c.metric(
+        "Escala de velocidade",
+        f"{scales['velocity']:.5e}"
+    )
+
+    st.warning(
+        "As escalas acima são referências assintóticas "
+        "parametrizadas. Não representam, por si mesmas, "
+        "uma solução completa das equações de Navier–Stokes "
+        "nem uma demonstração de singularidade."
+    )
+
+    st.divider()
+
+    st.caption(
+        "LRG — Lunz Research Group | "
+        "Simulação exploratória e validação numérica."
+    )
+
+
+# ============================================================
+# 6. EXECUÇÃO
+# ============================================================
+
+if __name__ == "__main__":
+
+    main()
